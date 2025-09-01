@@ -4,3 +4,4 @@ test.py
 setup.py
 temp_audio.mp3 
 output 
+.env
