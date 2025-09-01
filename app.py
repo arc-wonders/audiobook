@@ -3,11 +3,14 @@ import os
 import re
 import json
 import asyncio
+import threading
+import requests
+import tempfile
+import time 
+import base64
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import hashlib
-import tempfile
-import time 
 
 # TTS Libraries
 try:
@@ -72,7 +75,6 @@ class HealthCheck:
 
 # Global health check instance
 health_checker = HealthCheck()
-
 
 class AudiobookParser:
     """Parser for the NCF 2023 audiobook text file"""
@@ -179,7 +181,8 @@ class FreeTTSClient:
             try:
                 self.pyttsx3_engine = pyttsx3.init()
                 self.setup_pyttsx3_engine()
-            except:
+            except Exception as e:
+                st.warning(f"pyttsx3 initialization failed: {e}")
                 self.pyttsx3_engine = None
         else:
             self.pyttsx3_engine = None
@@ -187,10 +190,13 @@ class FreeTTSClient:
     def setup_pyttsx3_engine(self):
         """Configure pyttsx3 engine settings"""
         if self.pyttsx3_engine:
-            # Set speech rate
-            self.pyttsx3_engine.setProperty('rate', 180)
-            # Set volume
-            self.pyttsx3_engine.setProperty('volume', 0.9)
+            try:
+                # Set speech rate
+                self.pyttsx3_engine.setProperty('rate', 180)
+                # Set volume
+                self.pyttsx3_engine.setProperty('volume', 0.9)
+            except Exception as e:
+                st.warning(f"pyttsx3 setup failed: {e}")
     
     def get_cache_key(self, text: str, tts_type: str, voice: str = "") -> str:
         """Generate cache key"""
@@ -199,15 +205,18 @@ class FreeTTSClient:
     
     def get_cached_audio(self, cache_key: str) -> Optional[bytes]:
         """Get cached audio"""
-        cache_file = self.cache_dir / f"{cache_key}.wav"
-        if cache_file.exists():
-            return cache_file.read_bytes()
+        try:
+            cache_file = self.cache_dir / f"{cache_key}.mp3"
+            if cache_file.exists():
+                return cache_file.read_bytes()
+        except Exception as e:
+            st.warning(f"Cache read error: {e}")
         return None
     
     def cache_audio(self, cache_key: str, audio_data: bytes):
         """Cache audio data"""
         try:
-            cache_file = self.cache_dir / f"{cache_key}.wav"
+            cache_file = self.cache_dir / f"{cache_key}.mp3"
             cache_file.write_bytes(audio_data)
         except Exception as e:
             st.warning(f"Failed to cache audio: {str(e)}")
@@ -218,11 +227,16 @@ class FreeTTSClient:
             return None
         
         try:
+            # Limit text length for gTTS
+            if len(text) > 5000:
+                text = text[:5000] + "..."
+            
             tts = gTTS(text=text, lang=lang, slow=False)
             
             with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
                 tts.save(tmp_file.name)
-                audio_data = tmp_file.read()
+                tmp_file.seek(0)
+                audio_data = open(tmp_file.name, 'rb').read()
                 
             # Clean up temp file
             os.unlink(tmp_file.name)
@@ -242,7 +256,9 @@ class FreeTTSClient:
                 self.pyttsx3_engine.save_to_file(text, tmp_file.name)
                 self.pyttsx3_engine.runAndWait()
                 
-                audio_data = tmp_file.read()
+                # Convert to bytes
+                with open(tmp_file.name, 'rb') as f:
+                    audio_data = f.read()
                 
             os.unlink(tmp_file.name)
             return audio_data
@@ -257,6 +273,10 @@ class FreeTTSClient:
             return None
         
         try:
+            # Limit text length
+            if len(text) > 5000:
+                text = text[:5000] + "..."
+                
             communicate = edge_tts.Communicate(text, voice)
             audio_data = b""
             
@@ -287,12 +307,17 @@ class FreeTTSClient:
             audio_data = self.generate_pyttsx3_audio(text)
         elif tts_type == "edge" and EDGE_TTS_AVAILABLE:
             # Run async function
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 audio_data = loop.run_until_complete(self.generate_edge_tts_audio(text, voice))
+            except Exception as e:
+                st.error(f"Async error: {e}")
             finally:
-                loop.close()
+                try:
+                    loop.close()
+                except:
+                    pass
         
         if audio_data and use_cache:
             cache_key = self.get_cache_key(text, tts_type, voice)
@@ -364,10 +389,31 @@ def display_tts_status():
                 st.error("❌ edge-tts Not Installed")
                 st.code("pip install edge-tts")
 
+def create_audio_player(audio_data: bytes, audio_format: str = "audio/mp3") -> str:
+    """Create a mobile-friendly audio player"""
+    # Convert audio to base64
+    audio_b64 = base64.b64encode(audio_data).decode()
+    
+    # Create HTML audio player with mobile-friendly controls
+    audio_html = f"""
+    <div style="margin: 20px 0;">
+        <audio controls style="width: 100%; height: 50px;" preload="auto">
+            <source src="data:{audio_format};base64,{audio_b64}" type="{audio_format}">
+            Your browser does not support the audio element.
+        </audio>
+    </div>
+    """
+    return audio_html
+
 def main():
     st.title("📚 Free TTS Audiobook Reader - NCF 2023")
     st.markdown("*National Curriculum Framework for School Education 2023*")
     st.markdown("---")
+    
+    # Start health check
+    if 'health_check_started' not in st.session_state:
+        health_checker.start_health_check()
+        st.session_state.health_check_started = True
     
     # Display TTS status
     display_tts_status()
@@ -379,12 +425,16 @@ def main():
         st.stop()
     
     # Initialize TTS client
-    tts_client = FreeTTSClient()
+    if 'tts_client' not in st.session_state:
+        st.session_state.tts_client = FreeTTSClient()
+    
+    tts_client = st.session_state.tts_client
     
     # Load audiobook content
     file_path = "full_text.txt"
     if not os.path.exists(file_path):
         st.error(f"📄 Text file '{file_path}' not found!")
+        st.info("Please ensure 'full_text.txt' is in the same directory as this app.")
         st.stop()
     
     if 'parsed_content' not in st.session_state:
@@ -412,7 +462,8 @@ def main():
             selected_tts = st.selectbox(
                 "Choose TTS Engine:",
                 options=list(available_options.keys()),
-                format_func=lambda x: available_options[x]["name"]
+                format_func=lambda x: available_options[x]["name"],
+                key="tts_selector"
             )
             
             # Show TTS info
@@ -428,7 +479,7 @@ def main():
                     "en-US-AriaNeural",
                     "en-US-GuyNeural"
                 ]
-                selected_voice = st.selectbox("Voice:", voices)
+                selected_voice = st.selectbox("Voice:", voices, key="voice_selector")
         
         # Section navigation
         st.subheader("📖 Navigation")
@@ -440,7 +491,8 @@ def main():
         selected_section = st.selectbox(
             "Select Section:",
             sections,
-            index=sections.index(st.session_state.current_section) if st.session_state.current_section in sections else 0
+            index=sections.index(st.session_state.current_section) if st.session_state.current_section in sections else 0,
+            key="section_selector"
         )
         st.session_state.current_section = selected_section
         
@@ -457,6 +509,9 @@ def main():
             st.subheader("📊 Section Stats")
             st.metric("Words", word_count)
             st.metric("Characters", len(current_text))
+            
+            # Show total sections
+            st.metric("Total Sections", len(sections))
     
     # Main content
     if selected_section:
@@ -468,24 +523,49 @@ def main():
         tab1, tab2 = st.tabs(["📄 Read", "🎧 Listen"])
         
         with tab1:
-            st.markdown(current_text)
+            # Make text more readable on mobile
+            st.markdown(f"""
+            <div style="font-size: 16px; line-height: 1.6; padding: 10px;">
+            {current_text.replace(chr(10), '<br>')}
+            </div>
+            """, unsafe_allow_html=True)
         
         with tab2:
             st.subheader("🎵 Audio Generation")
             
             # Text length handling
+            text_for_tts = current_text
             if len(current_text) > max_length:
                 st.warning(f"⚠️ Text will be truncated to {max_length} characters for TTS")
                 text_for_tts = current_text[:max_length] + "..."
-            else:
-                text_for_tts = current_text
+            
+            # Show text that will be converted
+            with st.expander("📝 Preview Text for TTS"):
+                st.text_area("Text to convert:", text_for_tts, height=100, disabled=True)
             
             # Clean text
             parser = AudiobookParser("")
             cleaned_text = parser.clean_text_for_speech(text_for_tts)
             
             # Generate audio button
-            if st.button("🎵 Generate Audio", type="primary", use_container_width=True):
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                generate_btn = st.button("🎵 Generate Audio", type="primary", use_container_width=True)
+            
+            with col2:
+                if st.button("🗑️ Clear Cache"):
+                    try:
+                        cache_dir = Path("audio_cache")
+                        if cache_dir.exists():
+                            for file in cache_dir.glob("*"):
+                                file.unlink()
+                        st.success("Cache cleared!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to clear cache: {e}")
+            
+            if generate_btn:
                 if available_options:
                     with st.spinner(f"Generating audio with {available_options[selected_tts]['name']}..."):
                         voice = selected_voice if selected_tts == "edge" else ""
@@ -497,48 +577,60 @@ def main():
                         )
                         
                         if audio_data:
-                            st.success("🎉 Audio generated!")
+                            st.success("🎉 Audio generated successfully!")
                             
                             # Determine audio format
-                            audio_format = "audio/mp3" if selected_tts == "gtts" else "audio/wav"
-                            file_ext = ".mp3" if selected_tts == "gtts" else ".wav"
+                            audio_format = "audio/mp3"
+                            file_ext = ".mp3"
                             
+                            # Use both Streamlit native and custom HTML player
                             st.audio(audio_data, format=audio_format)
+                            
+                            # Mobile-friendly HTML player as backup
+                            st.markdown("**Alternative Player (if above doesn't work):**")
+                            audio_html = create_audio_player(audio_data, audio_format)
+                            st.markdown(audio_html, unsafe_allow_html=True)
                             
                             # Download button
                             st.download_button(
-                                label="📥 Download Audio",
+                                label="📥 Download Audio File",
                                 data=audio_data,
-                                file_name=f"{selected_section.replace(' ', '_')}{file_ext}",
-                                mime=audio_format
+                                file_name=f"NCF2023_{selected_section.replace(' ', '_').replace('/', '_')}{file_ext}",
+                                mime=audio_format,
+                                use_container_width=True
                             )
+                            
+                            # Store in session state for playback
+                            st.session_state[f'audio_{selected_section}'] = audio_data
+                            
                         else:
-                            st.error("❌ Failed to generate audio")
+                            st.error("❌ Failed to generate audio. Please try again or switch TTS engines.")
                 else:
                     st.error("No TTS engines available")
             
-            # Cache management
-            if st.button("🗑️ Clear Audio Cache"):
-                try:
-                    cache_dir = Path("audio_cache")
-                    if cache_dir.exists():
-                        for file in cache_dir.glob("*"):
-                            file.unlink()
-                    st.success("Cache cleared!")
-                except Exception as e:
-                    st.error(f"Failed to clear cache: {e}")
+            # Show cached audio if available
+            if f'audio_{selected_section}' in st.session_state:
+                st.markdown("---")
+                st.markdown("**🔄 Previously Generated Audio:**")
+                cached_audio = st.session_state[f'audio_{selected_section}']
+                st.audio(cached_audio, format="audio/mp3")
     
     # Footer
     st.markdown("---")
     st.markdown(
         """
-        <div style='text-align: center; color: #666;'>
+        <div style='text-align: center; color: #666; padding: 20px;'>
             <p><strong>Free TTS Audiobook Reader for NCF 2023</strong></p>
             <p>🆓 Using Free TTS Libraries | No API Keys Required</p>
+            <p>📱 Mobile Optimized | 💾 Audio Caching Enabled</p>
         </div>
         """,
         unsafe_allow_html=True
     )
+    
+    # Health endpoint for Render
+    if st.query_params.get("health") == "check":
+        st.json({"status": "healthy", "timestamp": time.time()})
 
 if __name__ == "__main__":
     main()
